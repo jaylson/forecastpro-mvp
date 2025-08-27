@@ -1,4 +1,4 @@
-﻿import type { Request, Response } from 'express'
+import type { Request, Response } from 'express'
 import express from 'express'
 import cors from 'cors'
 import helmet from 'helmet'
@@ -8,6 +8,9 @@ import pinoHttp from 'pino-http'
 import multer from 'multer'
 import { parse } from 'csv-parse'
 import { prisma } from './prisma'
+import { OrgCreateSchema, DatasetCreateSchema, ForecastRequestSchema } from './validation'
+import { requireOrgRole } from './rbac'
+import { mountSwagger } from './swagger'
 import { authMiddleware } from './auth'
 
 const app = express()
@@ -21,29 +24,48 @@ app.use(pinoHttp({ logger }))
 app.use(rateLimit({ windowMs: 60_000, max: 300 }))
 app.use(authMiddleware)
 
+mountSwagger(app)
 app.get('/health', (_req, res) => res.json({ ok: true }))
 
 // Create organization
 app.post('/orgs', async (req: Request, res: Response) => {
-  const name = (req.body?.name || '').toString().trim()
-  if (!name) return res.status(400).json({ error: 'name required' })
+  const parsed = OrgCreateSchema.safeParse(req.body)
+  if (!parsed.success) {
+    return res.status(400).json({ error: parsed.error.flatten() })
+  }
   const user = req.user
-  const org = await prisma.organization.create({ data: { name } })
+  const org = await prisma.organization.create({ data: { name: parsed.data.name } })
   if (user) {
-    await prisma.membership.create({ data: { organizationId: org.id, userId: user.id, role: 'OWNER' as any } })
+    await prisma.membership.create({
+      data: { organizationId: org.id, userId: user.id, role: 'OWNER' as any },
+    })
   }
   res.json(org)
 })
 
 // Create dataset
-app.post('/datasets', async (req: Request, res: Response) => {
-  const orgId = req.orgId
-  if (!orgId) return res.status(400).json({ error: 'x-org-id header required' })
-  const { name, description } = req.body || {}
-  if (!name) return res.status(400).json({ error: 'name required' })
-  const ds = await prisma.dataset.create({ data: { organizationId: orgId, name, description: description || null } })
-  res.json(ds)
-})
+app.post(
+  '/datasets',
+  requireOrgRole(['OWNER', 'ADMIN', 'ANALYST']),
+  async (req: Request, res: Response) => {
+    const orgId = req.orgId
+    if (!orgId) return res.status(400).json({ error: 'x-org-id header required' })
+
+    const parsed = DatasetCreateSchema.safeParse(req.body)
+    if (!parsed.success) {
+      return res.status(400).json({ error: parsed.error.flatten() })
+    }
+
+    const ds = await prisma.dataset.create({
+      data: {
+        organizationId: orgId,
+        name: parsed.data.name,
+        description: parsed.data.description ?? null,
+      },
+    })
+    res.json(ds)
+  },
+)
 
 // CSV import: date,value
 app.post('/datasets/:id/points/csv', upload.single('file'), async (req: Request, res: Response) => {
@@ -75,12 +97,21 @@ app.post('/datasets/:id/points/csv', upload.single('file'), async (req: Request,
   res.json({ imported: records.length })
 })
 
-// Naive forecast: mean of last 3 months
-app.post('/datasets/:id/forecast', async (req: Request, res: Response) => {
-  const orgId = req.orgId
-  if (!orgId) return res.status(400).json({ error: 'x-org-id header required' })
-  const datasetId = req.params.id
-  const horizon = Number(req.body?.horizon || 3)
+// Naive forecast: mean of last 3 months  + MAPE + Alerts
+app.post(
+  '/datasets/:id/forecast',
+  requireOrgRole(['OWNER', 'ADMIN', 'ANALYST']),
+  async (req: Request, res: Response) => {
+    const orgId = req.orgId
+    if (!orgId) return res.status(400).json({ error: 'x-org-id header required' })
+
+    const datasetId = req.params.id
+
+    const parsed = ForecastRequestSchema.safeParse(req.body || {})
+    if (!parsed.success) {
+      return res.status(400).json({ error: parsed.error.flatten() })
+    }
+    const horizon = parsed.data.horizon
   const points = await prisma.dataPoint.findMany({ where: { datasetId }, orderBy: { date: 'asc' } })
   if (points.length < 3) return res.status(400).json({ error: 'need at least 3 points' })
   const last3 = points.slice(-3).map((p) => Number(p.value))
@@ -91,12 +122,42 @@ app.post('/datasets/:id/forecast', async (req: Request, res: Response) => {
     const d = new Date(Date.UTC(lastDate.getUTCFullYear(), lastDate.getUTCMonth() + i, 1))
     results.push({ date: d, predicted: Math.round(mean * 100) / 100 })
   }
-  const run = await prisma.forecastRun.create({ data: { organizationId: orgId, datasetId, status: 'DONE' as any, horizon } })
+  // MAPE on last three
+  const mape =
+    (last3.reduce((acc, v) => acc + Math.abs((v - mean) / (v || 1)), 0) / last3.length) * 100
+
+  const run = await prisma.forecastRun.create({
+    data: { organizationId: orgId, datasetId, status: 'DONE' as any, horizon, mape },
+  })
   for (const r of results) {
     await prisma.forecastResult.create({ data: { runId: run.id, date: r.date, predicted: r.predicted as any } })
   }
-  res.json({ runId: run.id, results })
-})
+  // Alert evaluation (compare next prediction with last actual)
+  const rules = await prisma.alertRule.findMany({ where: { datasetId, active: true } })
+  if (rules.length && results.length) {
+    const nextPred = results[0].predicted
+    const lastActual = Number(points[points.length - 1].value)
+    if (lastActual) {
+      const pctDiff = Math.abs((nextPred - lastActual) / lastActual) * 100
+      for (const rule of rules) {
+        if (pctDiff >= rule.thresholdPct) {
+          await prisma.alertEvent.create({
+            data: {
+              organizationId: orgId,
+              ruleId: rule.id,
+              datasetId,
+              message: `Forecast change ${pctDiff.toFixed(
+                2,
+              )}% exceeds threshold ${rule.thresholdPct}%`,
+            },
+          })
+        }
+      }
+    }
+  }
+  res.json({ runId: run.id, results, mape })
+},
+)
 
 // Dashboard: last 12 actual + last forecast results
 app.get('/dashboard/:id', async (req: Request, res: Response) => {
@@ -120,6 +181,57 @@ app.get('/datasets/:id/export.csv', async (req: Request, res: Response) => {
   }
   res.end()
 })
+// ---------------- Additional endpoints ----------------
+
+// List organizations of current user
+app.get('/orgs', async (req: Request, res: Response) => {
+  const user = req.user
+  if (!user) return res.json([])
+  const memberships = await prisma.membership.findMany({
+    where: { userId: user.id },
+    include: { organization: true },
+  })
+  res.json(memberships.map((m) => m.organization))
+})
+
+// List datasets of current organization
+app.get('/datasets', async (req: Request, res: Response) => {
+  const orgId = req.orgId
+  if (!orgId) return res.status(400).json({ error: 'x-org-id header required' })
+  const list = await prisma.dataset.findMany({ where: { organizationId: orgId } })
+  res.json(list)
+})
+
+// Create alert rule on dataset
+app.post(
+  '/datasets/:id/alerts',
+  requireOrgRole(['OWNER', 'ADMIN']),
+  async (req: Request, res: Response) => {
+    const datasetId = req.params.id
+    const orgId = req.orgId
+    if (!orgId) return res.status(400).json({ error: 'x-org-id header required' })
+    const { name, thresholdPct, severity } = req.body || {}
+    if (!name || typeof thresholdPct !== 'number')
+      return res.status(400).json({ error: 'name and thresholdPct required' })
+    const rule = await prisma.alertRule.create({
+      data: {
+        organizationId: orgId,
+        datasetId,
+        name: name.toString(),
+        thresholdPct,
+        severity: severity || 'WARNING',
+      },
+    })
+    res.json(rule)
+  },
+)
+
+// List alert rules
+app.get('/datasets/:id/alerts', async (req: Request, res: Response) => {
+  const rules = await prisma.alertRule.findMany({ where: { datasetId: req.params.id } })
+  res.json(rules)
+})
+
 
 const port = Number(process.env.PORT || 3000)
 app.listen(port, () => logger.info({ port }, 'API listening'))
