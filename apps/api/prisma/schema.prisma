@@ -1,4 +1,5 @@
-﻿// prisma/schema.prisma
+// Prisma schema for ForecastPro MVP
+
 generator client {
   provider = "prisma-client-js"
 }
@@ -8,21 +9,6 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
-model User {
-  id           String   @id @default(cuid())
-  email        String   @unique
-  displayName  String?
-  createdAt    DateTime @default(now())
-  memberships  Membership[]
-}
-
-model Organization {
-  id          String   @id @default(cuid())
-  name        String
-  createdAt   DateTime @default(now())
-  memberships Membership[]
-}
-
 enum Role {
   OWNER
   ADMIN
@@ -30,11 +16,251 @@ enum Role {
   VIEWER
 }
 
+enum DataSourceType {
+  CSV
+  ERP
+  CRM
+}
+
+enum JobStatus {
+  PENDING
+  PROCESSING
+  COMPLETED
+  FAILED
+}
+
+enum ForecastModelType {
+  NAIVE
+  ARIMA
+}
+
+enum ForecastRunStatus {
+  QUEUED
+  RUNNING
+  DONE
+  ERROR
+}
+
+enum AlertSeverity {
+  INFO
+  WARNING
+  CRITICAL
+}
+
+enum ExportFormat {
+  CSV
+  PDF
+}
+
+model User {
+  id           String       @id @default(cuid())
+  email        String       @unique
+  displayName  String?
+  createdAt    DateTime     @default(now())
+  updatedAt    DateTime     @updatedAt
+  memberships  Membership[]
+}
+
+model Organization {
+  id           String       @id @default(cuid())
+  name         String
+  createdAt    DateTime     @default(now())
+  updatedAt    DateTime     @updatedAt
+  memberships  Membership[]
+  dataSources  DataSource[]
+  datasets     Dataset[]
+  importJobs   ImportJob[]
+  forecastModels ForecastModel[]
+  forecastRuns  ForecastRun[]
+  alertRules    AlertRule[]
+  alertEvents   AlertEvent[]
+  reportExports ReportExport[]
+  scenarios     Scenario[]
+  integrations  Integration[]
+  apiTokens     ApiToken[]
+  billingSubscriptions BillingSubscription[]
+}
+
 model Membership {
   id             String        @id @default(cuid())
   userId         String
   organizationId String
   role           Role
-  user           User          @relation(fields: [userId], references: [id])
-  organization   Organization  @relation(fields: [organizationId], references: [id])
+  createdAt      DateTime      @default(now())
+  user           User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  organization   Organization  @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  @@unique([userId, organizationId])
+}
+
+model DataSource {
+  id             String        @id @default(cuid())
+  organizationId String
+  name           String
+  type           DataSourceType
+  config         Json?
+  createdAt      DateTime      @default(now())
+  updatedAt      DateTime      @updatedAt
+  organization   Organization  @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  datasets       Dataset[]
+}
+
+model Dataset {
+  id             String        @id @default(cuid())
+  organizationId String
+  dataSourceId   String?
+  name           String
+  description    String?
+  currency       String?       @default("BRL")
+  createdAt      DateTime      @default(now())
+  updatedAt      DateTime      @updatedAt
+  organization   Organization  @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  dataSource     DataSource?   @relation(fields: [dataSourceId], references: [id])
+  points         DataPoint[]
+  forecastRuns   ForecastRun[]
+  alertRules     AlertRule[]
+  importJobs     ImportJob[]
+  alertEvents    AlertEvent[]
+  reportExports  ReportExport[]
+}
+
+model DataPoint {
+  id        String   @id @default(cuid())
+  datasetId String
+  date      DateTime
+  value     Decimal  @db.Decimal(18,4)
+  createdAt DateTime @default(now())
+  dataset   Dataset  @relation(fields: [datasetId], references: [id], onDelete: Cascade)
+  @@unique([datasetId, date])
+}
+
+model ImportJob {
+  id             String        @id @default(cuid())
+  organizationId String
+  datasetId      String?
+  status         JobStatus     @default(PENDING)
+  error          String?
+  mapping        Json?
+  createdAt      DateTime      @default(now())
+  completedAt    DateTime?
+  organization   Organization  @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  dataset        Dataset?      @relation(fields: [datasetId], references: [id])
+}
+
+model ForecastModel {
+  id             String            @id @default(cuid())
+  organizationId String
+  name           String
+  type           ForecastModelType
+  params         Json?
+  createdAt      DateTime          @default(now())
+  updatedAt      DateTime          @updatedAt
+  organization   Organization      @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  runs           ForecastRun[]
+}
+
+model ForecastRun {
+  id              String            @id @default(cuid())
+  organizationId  String
+  datasetId       String
+  modelId         String?
+  status          ForecastRunStatus @default(QUEUED)
+  mape            Float?
+  horizon         Int               @default(3)
+  createdAt       DateTime          @default(now())
+  completedAt     DateTime?
+  organization    Organization      @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  dataset         Dataset           @relation(fields: [datasetId], references: [id], onDelete: Cascade)
+  model           ForecastModel?    @relation(fields: [modelId], references: [id])
+  results         ForecastResult[]
+}
+
+model ForecastResult {
+  id           String       @id @default(cuid())
+  runId        String
+  date         DateTime
+  predicted    Decimal      @db.Decimal(18,4)
+  lowerBand    Decimal?     @db.Decimal(18,4)
+  upperBand    Decimal?     @db.Decimal(18,4)
+  createdAt    DateTime     @default(now())
+  run          ForecastRun  @relation(fields: [runId], references: [id], onDelete: Cascade)
+  @@unique([runId, date])
+}
+
+model AlertRule {
+  id             String        @id @default(cuid())
+  organizationId String
+  datasetId      String
+  name           String
+  thresholdPct   Float         @default(15)
+  severity       AlertSeverity @default(WARNING)
+  active         Boolean       @default(true)
+  createdAt      DateTime      @default(now())
+  updatedAt      DateTime      @updatedAt
+  organization   Organization  @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  dataset        Dataset       @relation(fields: [datasetId], references: [id], onDelete: Cascade)
+  events         AlertEvent[]
+}
+
+model AlertEvent {
+  id             String        @id @default(cuid())
+  organizationId String
+  ruleId         String
+  datasetId      String
+  occurredAt     DateTime      @default(now())
+  message        String
+  createdAt      DateTime      @default(now())
+  rule           AlertRule     @relation(fields: [ruleId], references: [id], onDelete: Cascade)
+  organization   Organization  @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  dataset        Dataset       @relation(fields: [datasetId], references: [id], onDelete: Cascade)
+}
+
+model ReportExport {
+  id             String        @id @default(cuid())
+  organizationId String
+  datasetId      String
+  format         ExportFormat
+  url            String?
+  createdAt      DateTime      @default(now())
+  organization   Organization  @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  dataset        Dataset       @relation(fields: [datasetId], references: [id], onDelete: Cascade)
+}
+
+// Phase 2 skeletons
+model Scenario {
+  id             String        @id @default(cuid())
+  organizationId String
+  name           String
+  params         Json?
+  createdAt      DateTime      @default(now())
+  organization   Organization  @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+}
+
+model Integration {
+  id             String        @id @default(cuid())
+  organizationId String
+  type           String
+  config         Json?
+  createdAt      DateTime      @default(now())
+  organization   Organization  @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+}
+
+model ApiToken {
+  id             String        @id @default(cuid())
+  organizationId String
+  name           String
+  tokenHash      String
+  createdAt      DateTime      @default(now())
+  organization   Organization  @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  @@unique([organizationId, name])
+}
+
+model BillingSubscription {
+  id             String        @id @default(cuid())
+  organizationId String
+  provider       String
+  plan           String
+  status         String
+  createdAt      DateTime      @default(now())
+  updatedAt      DateTime      @updatedAt
+  organization   Organization  @relation(fields: [organizationId], references: [id], onDelete: Cascade)
 }
