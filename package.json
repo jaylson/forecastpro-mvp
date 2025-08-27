@@ -1,0 +1,13 @@
+{
+  "name": "forecastpro-mvp",
+  "version": "0.1.0",
+  "private": true,
+  "packageManager": "pnpm@10.15.0",
+  "workspaces": ["apps/*", "packages/*"],
+  "scripts": {
+    "dev": "npx pnpm -C apps/api dev",
+    "build": "npx pnpm -C apps/api build && npx pnpm -C apps/web build",
+    "lint": "npx pnpm -r lint",
+    "test": "npx pnpm -r test"
+  }
+}
