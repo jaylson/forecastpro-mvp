@@ -9,10 +9,10 @@ migrate:
 	docker compose run --rm api pnpm prisma:migrate
 
 seed:
-	docker compose run --rm api node dist/seed.js
+	docker compose run --rm api pnpm seed
 
 lint:
-	npx pnpm -r lint
+	pnpm -r lint
 
 test:
-	npx pnpm -r test
+	pnpm -r test

@@ -8,6 +8,7 @@ import pinoHttp from 'pino-http'
 import multer from 'multer'
 import { parse } from 'csv-parse'
 import { prisma } from './prisma'
+import { Prisma } from '@prisma/client'
 import { OrgCreateSchema, DatasetCreateSchema, ForecastRequestSchema } from './validation'
 import { requireOrgRole } from './rbac'
 import { mountSwagger } from './swagger'
@@ -17,8 +18,13 @@ const app = express()
 const logger = pino({ level: process.env.LOG_LEVEL || 'info' })
 const upload = multer({ storage: multer.memoryStorage() })
 
+// Parse CORS origins from environment variable
+const corsOrigins = process.env.CORS_ORIGINS
+  ? process.env.CORS_ORIGINS.split(',').map(origin => origin.trim())
+  : ['http://localhost:5173', 'http://localhost:3000']
+
 app.use(helmet())
-app.use(cors({ origin: ['http://localhost:5173', 'http://localhost:3000'], credentials: true }))
+app.use(cors({ origin: corsOrigins, credentials: true }))
 app.use(express.json({ limit: '5mb' }))
 app.use(pinoHttp({ logger }))
 app.use(rateLimit({ windowMs: 60_000, max: 300 }))
@@ -26,6 +32,12 @@ app.use(authMiddleware)
 
 mountSwagger(app)
 app.get('/health', (_req, res) => res.json({ ok: true }))
+
+// Helper: verify dataset belongs to organization
+async function verifyDatasetOwnership(datasetId: string, orgId: string): Promise<boolean> {
+  const dataset = await prisma.dataset.findUnique({ where: { id: datasetId } })
+  return dataset?.organizationId === orgId
+}
 
 // Create organization
 app.post('/orgs', async (req: Request, res: Response) => {
@@ -37,7 +49,7 @@ app.post('/orgs', async (req: Request, res: Response) => {
   const org = await prisma.organization.create({ data: { name: parsed.data.name } })
   if (user) {
     await prisma.membership.create({
-      data: { organizationId: org.id, userId: user.id, role: 'OWNER' as any },
+      data: { organizationId: org.id, userId: user.id, role: 'OWNER' },
     })
   }
   res.json(org)
@@ -68,10 +80,19 @@ app.post(
 )
 
 // CSV import: date,value
-app.post('/datasets/:id/points/csv', upload.single('file'), async (req: Request, res: Response) => {
+app.post('/datasets/:id/points/csv',
+  requireOrgRole(['OWNER', 'ADMIN', 'ANALYST']),
+  upload.single('file'),
+  async (req: Request, res: Response) => {
   const orgId = req.orgId
   if (!orgId) return res.status(400).json({ error: 'x-org-id header required' })
   const datasetId = req.params.id
+
+  // Verify dataset belongs to organization
+  if (!(await verifyDatasetOwnership(datasetId, orgId))) {
+    return res.status(403).json({ error: 'Dataset not found or access denied' })
+  }
+
   if (!req.file) return res.status(400).json({ error: 'file required' })
   const csv = req.file.buffer.toString('utf8')
   const records: { date: Date; value: number }[] = []
@@ -90,8 +111,8 @@ app.post('/datasets/:id/points/csv', upload.single('file'), async (req: Request,
   for (const r of records) {
     await prisma.dataPoint.upsert({
       where: { datasetId_date: { datasetId, date: r.date } },
-      update: { value: r.value as any },
-      create: { datasetId, date: r.date, value: r.value as any },
+      update: { value: new Prisma.Decimal(r.value) },
+      create: { datasetId, date: r.date, value: new Prisma.Decimal(r.value) },
     })
   }
   res.json({ imported: records.length })
@@ -106,6 +127,11 @@ app.post(
     if (!orgId) return res.status(400).json({ error: 'x-org-id header required' })
 
     const datasetId = req.params.id
+
+    // Verify dataset belongs to organization
+    if (!(await verifyDatasetOwnership(datasetId, orgId))) {
+      return res.status(403).json({ error: 'Dataset not found or access denied' })
+    }
 
     const parsed = ForecastRequestSchema.safeParse(req.body || {})
     if (!parsed.success) {
@@ -122,15 +148,17 @@ app.post(
     const d = new Date(Date.UTC(lastDate.getUTCFullYear(), lastDate.getUTCMonth() + i, 1))
     results.push({ date: d, predicted: Math.round(mean * 100) / 100 })
   }
-  // MAPE on last three
-  const mape =
-    (last3.reduce((acc, v) => acc + Math.abs((v - mean) / (v || 1)), 0) / last3.length) * 100
+  // MAPE on last three (skip zero values to avoid division by zero)
+  const nonZeroValues = last3.filter(v => v !== 0)
+  const mape = nonZeroValues.length > 0
+    ? (nonZeroValues.reduce((acc, v) => acc + Math.abs((v - mean) / v), 0) / nonZeroValues.length) * 100
+    : 0
 
   const run = await prisma.forecastRun.create({
     data: { organizationId: orgId, datasetId, status: 'DONE' as any, horizon, mape },
   })
   for (const r of results) {
-    await prisma.forecastResult.create({ data: { runId: run.id, date: r.date, predicted: r.predicted as any } })
+    await prisma.forecastResult.create({ data: { runId: run.id, date: r.date, predicted: new Prisma.Decimal(r.predicted) } })
   }
   // Alert evaluation (compare next prediction with last actual)
   const rules = await prisma.alertRule.findMany({ where: { datasetId, active: true } })
@@ -160,8 +188,18 @@ app.post(
 )
 
 // Dashboard: last 12 actual + last forecast results
-app.get('/dashboard/:id', async (req: Request, res: Response) => {
+app.get('/dashboard/:id',
+  requireOrgRole(['OWNER', 'ADMIN', 'ANALYST', 'VIEWER']),
+  async (req: Request, res: Response) => {
   const datasetId = req.params.id
+  const orgId = req.orgId
+  if (!orgId) return res.status(400).json({ error: 'x-org-id header required' })
+
+  // Verify dataset belongs to organization
+  if (!(await verifyDatasetOwnership(datasetId, orgId))) {
+    return res.status(403).json({ error: 'Dataset not found or access denied' })
+  }
+
   const actual = await prisma.dataPoint.findMany({ where: { datasetId }, orderBy: { date: 'asc' }, take: -12 as any })
   const lastRun = await prisma.forecastRun.findFirst({ where: { datasetId }, orderBy: { createdAt: 'desc' } })
   const forecast = lastRun ? await prisma.forecastResult.findMany({ where: { runId: lastRun.id }, orderBy: { date: 'asc' } }) : []
@@ -169,8 +207,18 @@ app.get('/dashboard/:id', async (req: Request, res: Response) => {
 })
 
 // CSV export
-app.get('/datasets/:id/export.csv', async (req: Request, res: Response) => {
+app.get('/datasets/:id/export.csv',
+  requireOrgRole(['OWNER', 'ADMIN', 'ANALYST']),
+  async (req: Request, res: Response) => {
   const datasetId = req.params.id
+  const orgId = req.orgId
+  if (!orgId) return res.status(400).json({ error: 'x-org-id header required' })
+
+  // Verify dataset belongs to organization
+  if (!(await verifyDatasetOwnership(datasetId, orgId))) {
+    return res.status(403).json({ error: 'Dataset not found or access denied' })
+  }
+
   const points = await prisma.dataPoint.findMany({ where: { datasetId }, orderBy: { date: 'asc' } })
   res.setHeader('Content-Type', 'text/csv')
   res.setHeader('Content-Disposition', `attachment; filename="dataset-${datasetId}.csv"`)
@@ -195,7 +243,9 @@ app.get('/orgs', async (req: Request, res: Response) => {
 })
 
 // List datasets of current organization
-app.get('/datasets', async (req: Request, res: Response) => {
+app.get('/datasets',
+  requireOrgRole(['OWNER', 'ADMIN', 'ANALYST', 'VIEWER']),
+  async (req: Request, res: Response) => {
   const orgId = req.orgId
   if (!orgId) return res.status(400).json({ error: 'x-org-id header required' })
   const list = await prisma.dataset.findMany({ where: { organizationId: orgId } })
@@ -210,9 +260,19 @@ app.post(
     const datasetId = req.params.id
     const orgId = req.orgId
     if (!orgId) return res.status(400).json({ error: 'x-org-id header required' })
+
+    // Verify dataset belongs to organization
+    if (!(await verifyDatasetOwnership(datasetId, orgId))) {
+      return res.status(403).json({ error: 'Dataset not found or access denied' })
+    }
+
     const { name, thresholdPct, severity } = req.body || {}
     if (!name || typeof thresholdPct !== 'number')
       return res.status(400).json({ error: 'name and thresholdPct required' })
+    if (thresholdPct < 0 || thresholdPct > 1000)
+      return res.status(400).json({ error: 'thresholdPct must be between 0 and 1000' })
+    if (severity && !['INFO', 'WARNING', 'ERROR', 'CRITICAL'].includes(severity))
+      return res.status(400).json({ error: 'severity must be INFO, WARNING, ERROR, or CRITICAL' })
     const rule = await prisma.alertRule.create({
       data: {
         organizationId: orgId,
@@ -227,8 +287,19 @@ app.post(
 )
 
 // List alert rules
-app.get('/datasets/:id/alerts', async (req: Request, res: Response) => {
-  const rules = await prisma.alertRule.findMany({ where: { datasetId: req.params.id } })
+app.get('/datasets/:id/alerts',
+  requireOrgRole(['OWNER', 'ADMIN', 'ANALYST', 'VIEWER']),
+  async (req: Request, res: Response) => {
+  const datasetId = req.params.id
+  const orgId = req.orgId
+  if (!orgId) return res.status(400).json({ error: 'x-org-id header required' })
+
+  // Verify dataset belongs to organization
+  if (!(await verifyDatasetOwnership(datasetId, orgId))) {
+    return res.status(403).json({ error: 'Dataset not found or access denied' })
+  }
+
+  const rules = await prisma.alertRule.findMany({ where: { datasetId } })
   res.json(rules)
 })
 

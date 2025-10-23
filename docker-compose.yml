@@ -2,11 +2,11 @@
   db:
     image: postgres:15
     environment:
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
-      POSTGRES_DB: forecastpro
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: ${POSTGRES_DB:-forecastpro}
     ports:
-      - "55432:5432"
+      - "${POSTGRES_PORT:-55432}:5432"
     volumes:
       - db_data:/var/lib/postgresql/data
   redis:
@@ -17,10 +17,10 @@
     build: ./apps/api
     environment:
       - NODE_ENV=development
-      - DATABASE_URL=postgresql://postgres:postgres@db:5432/forecastpro
-      - REDIS_URL=redis://redis:6379
+      - DATABASE_URL=${DATABASE_URL:-postgresql://postgres:postgres@db:5432/forecastpro}
+      - REDIS_URL=${REDIS_URL:-redis://redis:6379}
     ports:
-      - "3000:3000"
+      - "${API_PORT:-3000}:3000"
     depends_on:
       - db
       - redis
@@ -31,7 +31,7 @@
     environment:
       - NODE_ENV=development
     ports:
-      - "5173:5173"
+      - "${WEB_PORT:-5173}:5173"
     volumes:
       - ./apps/web:/usr/src/app
     depends_on:
